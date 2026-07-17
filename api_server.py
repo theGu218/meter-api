@@ -1,7 +1,7 @@
 """
 智能电表能效分析 API 服务
-- /analyze : 给 Coze 使用，接收 JSON {"file": "文件临时URL"}
-- /upload  : 本地测试用，直接上传文件（multipart）
+- /analyze : Coze 专用，接收 JSON {"file": "文件临时URL"}
+- /upload  : 本地测试，直接上传文件
 """
 import sys
 import os
@@ -11,7 +11,6 @@ import pandas as pd
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
 
 # 确保可以导入 tools 包
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -21,7 +20,7 @@ from tools.consumption_analyzer import analyze_daily_consumption
 from tools.efficiency_evaluator import evaluate_overall_efficiency
 from tools.anomaly_detector import generate_anomaly_alert_report
 
-app = FastAPI(title="智能电表分析API", version="1.2.0")
+app = FastAPI(title="智能电表分析API", version="1.3.0")
 
 
 class FileURLRequest(BaseModel):
@@ -30,11 +29,20 @@ class FileURLRequest(BaseModel):
 
 
 def perform_analysis(suffix: str, tmp_path: str):
-    """统一的分析逻辑"""
-    if suffix == 'csv':
-        df = pd.read_csv(tmp_path)
-    else:
-        df = pd.read_excel(tmp_path)
+    """统一的分析逻辑，读取文件并分析（自动兼容 CSV/Excel）"""
+    # 读取文件，如果失败则尝试另一种格式
+    try:
+        if suffix in ('xls', 'xlsx'):
+            df = pd.read_excel(tmp_path)
+        else:
+            df = pd.read_csv(tmp_path)
+    except Exception:
+        # CSV 读取失败时尝试 Excel，反之亦然
+        if suffix in ('xls', 'xlsx'):
+            df = pd.read_csv(tmp_path)
+        else:
+            df = pd.read_excel(tmp_path)
+
     df = preprocess_meter_dataframe(df)
 
     daily = analyze_daily_consumption(df)
@@ -70,18 +78,24 @@ async def analyze_from_url(body: FileURLRequest):
     Coze 专用接口：接收 JSON 格式的文件 URL，下载后分析
     """
     file_url = body.file
-    suffix = file_url.split('.')[-1].split('?')[0].lower()
-    if suffix not in ('csv', 'xls', 'xlsx'):
-        return JSONResponse(
-            status_code=400,
-            content={"success": False, "error": "仅支持 CSV 或 Excel 文件"}
-        )
-
     tmp_path = None
     try:
         # 下载文件
         resp = requests.get(file_url, timeout=30)
         resp.raise_for_status()
+
+        # 根据 Content-Type 智能判断文件类型
+        content_type = resp.headers.get('Content-Type', '')
+        if 'csv' in content_type:
+            suffix = 'csv'
+        elif 'excel' in content_type or 'spreadsheet' in content_type:
+            suffix = 'xlsx'
+        else:
+            # 从 URL 尝试提取后缀，如果失败则默认 csv
+            suffix = file_url.split('.')[-1].split('?')[0].lower()
+            if suffix not in ('csv', 'xls', 'xlsx'):
+                suffix = 'csv'  # 兜底
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
             tmp.write(resp.content)
             tmp_path = tmp.name
