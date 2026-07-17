@@ -6,6 +6,7 @@
 import sys
 import os
 import tempfile
+import traceback
 import requests
 import pandas as pd
 from fastapi import FastAPI, File, UploadFile
@@ -20,7 +21,7 @@ from tools.consumption_analyzer import analyze_daily_consumption
 from tools.efficiency_evaluator import evaluate_overall_efficiency
 from tools.anomaly_detector import generate_anomaly_alert_report
 
-app = FastAPI(title="智能电表分析API", version="1.3.0")
+app = FastAPI(title="智能电表分析API", version="1.4.0")
 
 
 class FileURLRequest(BaseModel):
@@ -37,7 +38,7 @@ def perform_analysis(suffix: str, tmp_path: str):
         else:
             df = pd.read_csv(tmp_path)
     except Exception:
-        # CSV 读取失败时尝试 Excel，反之亦然
+        # 如果 CSV 读取失败，尝试 Excel
         if suffix in ('xls', 'xlsx'):
             df = pd.read_csv(tmp_path)
         else:
@@ -91,10 +92,9 @@ async def analyze_from_url(body: FileURLRequest):
         elif 'excel' in content_type or 'spreadsheet' in content_type:
             suffix = 'xlsx'
         else:
-            # 从 URL 尝试提取后缀，如果失败则默认 csv
             suffix = file_url.split('.')[-1].split('?')[0].lower()
             if suffix not in ('csv', 'xls', 'xlsx'):
-                suffix = 'csv'  # 兜底
+                suffix = 'csv'
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
             tmp.write(resp.content)
@@ -109,9 +109,12 @@ async def analyze_from_url(body: FileURLRequest):
             content={"success": False, "error": f"文件下载失败: {str(e)}"}
         )
     except Exception as e:
+        # 将完整的错误堆栈打印到 Railway 日志，并返回给 Coze（调试用）
+        error_detail = traceback.format_exc()
+        print(error_detail)  # Railway 日志中可见
         return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": f"分析失败: {str(e)}"}
+            status_code=400,  # 用 400 才能让 Coze 显示详细信息
+            content={"success": False, "error": f"分析失败: {str(e)}", "traceback": error_detail}
         )
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -141,9 +144,11 @@ async def analyze_from_upload(file: UploadFile = File(...)):
         return result
 
     except Exception as e:
+        error_detail = traceback.format_exc()
+        print(error_detail)
         return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": f"分析失败: {str(e)}"}
+            status_code=400,
+            content={"success": False, "error": f"分析失败: {str(e)}", "traceback": error_detail}
         )
     finally:
         if tmp_path and os.path.exists(tmp_path):
