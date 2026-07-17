@@ -7,8 +7,10 @@ import sys
 import os
 import tempfile
 import traceback
+import math
 import requests
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -21,12 +23,30 @@ from tools.consumption_analyzer import analyze_daily_consumption
 from tools.efficiency_evaluator import evaluate_overall_efficiency
 from tools.anomaly_detector import generate_anomaly_alert_report
 
-app = FastAPI(title="智能电表分析API", version="1.5.0")
+app = FastAPI(title="智能电表分析API", version="1.6.0")
 
 
 class FileURLRequest(BaseModel):
     """Coze 传入的文件 URL 请求体"""
     file: str
+
+
+def clean_nan(obj):
+    """递归地将对象中的 NaN/NaT 替换为 None，使其可 JSON 序列化"""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: clean_nan(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nan(v) for v in obj]
+    elif isinstance(obj, np.generic):
+        # numpy 标量，如 np.float64, np.int64 等
+        if np.issubdtype(obj, np.floating) and (np.isnan(obj) or np.isinf(obj)):
+            return None
+        return obj.item()
+    return obj
 
 
 def perform_analysis(suffix: str, tmp_path: str):
@@ -37,7 +57,6 @@ def perform_analysis(suffix: str, tmp_path: str):
         else:
             df = pd.read_csv(tmp_path)
     except Exception:
-        # 如果 CSV 读取失败，尝试 Excel
         if suffix in ('xls', 'xlsx'):
             df = pd.read_csv(tmp_path)
         else:
@@ -49,7 +68,7 @@ def perform_analysis(suffix: str, tmp_path: str):
     efficiency = evaluate_overall_efficiency(df)
     anomaly = generate_anomaly_alert_report(df)
 
-    return {
+    result = {
         "success": True,
         "data_summary": {
             "total_records": len(df),
@@ -70,6 +89,8 @@ def perform_analysis(suffix: str, tmp_path: str):
             "details": anomaly.get('details', [])[:5]
         }
     }
+    # 清理 NaN 值
+    return clean_nan(result)
 
 
 @app.post("/analyze")
@@ -86,7 +107,7 @@ async def analyze_from_url(body: FileURLRequest):
     try:
         # 下载文件
         resp = requests.get(file_url, timeout=30, headers={
-            "User-Agent": "Mozilla/5.0"  # 防止被 Coze 屏蔽
+            "User-Agent": "Mozilla/5.0"
         })
         resp.raise_for_status()
         content = resp.content
@@ -105,7 +126,7 @@ async def analyze_from_url(body: FileURLRequest):
         else:
             suffix = file_url.split('.')[-1].split('?')[0].lower()
             if suffix not in ('csv', 'xls', 'xlsx'):
-                suffix = 'csv'  # 兜底
+                suffix = 'csv'
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
             tmp.write(content)
@@ -126,7 +147,7 @@ async def analyze_from_url(body: FileURLRequest):
         print(f"Analysis error:\n{error_detail}", flush=True)
         return JSONResponse(
             status_code=400,
-            content={"success": False, "error": f"分析失败: {str(e)}", "trace": error_detail}
+            content={"success": False, "error": f"分析失败: {str(e)}"}
         )
     finally:
         if tmp_path and os.path.exists(tmp_path):
