@@ -1,7 +1,7 @@
 """
 智能电表能效分析 API 服务
 - /analyze : Coze 专用，接收 JSON {"file": "文件临时URL"}
-- /upload  : 本地测试，直接上传文件
+- /upload  : 本地测试，直接上传文件（备用）
 """
 import sys
 import os
@@ -13,6 +13,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+# 确保可以导入 tools 包
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from tools.data_loader import preprocess_meter_dataframe
@@ -20,20 +21,23 @@ from tools.consumption_analyzer import analyze_daily_consumption
 from tools.efficiency_evaluator import evaluate_overall_efficiency
 from tools.anomaly_detector import generate_anomaly_alert_report
 
-app = FastAPI(title="智能电表分析API", version="1.4.1")
+app = FastAPI(title="智能电表分析API", version="1.5.0")
 
 
 class FileURLRequest(BaseModel):
+    """Coze 传入的文件 URL 请求体"""
     file: str
 
 
 def perform_analysis(suffix: str, tmp_path: str):
+    """统一的分析逻辑，自动兼容 CSV 和 Excel"""
     try:
         if suffix in ('xls', 'xlsx'):
             df = pd.read_excel(tmp_path)
         else:
             df = pd.read_csv(tmp_path)
     except Exception:
+        # 如果 CSV 读取失败，尝试 Excel
         if suffix in ('xls', 'xlsx'):
             df = pd.read_csv(tmp_path)
         else:
@@ -70,16 +74,29 @@ def perform_analysis(suffix: str, tmp_path: str):
 
 @app.post("/analyze")
 async def analyze_from_url(body: FileURLRequest):
-    print("===== Coze request received =====", flush=True)
+    """
+    Coze 专用接口：接收 JSON 格式的文件 URL，下载后分析
+    """
+    print("=" * 40, flush=True)
+    print("Coze request received", flush=True)
     print(f"File URL: {body.file}", flush=True)
 
     file_url = body.file
     tmp_path = None
     try:
-        resp = requests.get(file_url, timeout=30)
+        # 下载文件
+        resp = requests.get(file_url, timeout=30, headers={
+            "User-Agent": "Mozilla/5.0"  # 防止被 Coze 屏蔽
+        })
         resp.raise_for_status()
-        print(f"Downloaded file, size: {len(resp.content)} bytes", flush=True)
+        content = resp.content
+        print(f"Downloaded {len(content)} bytes", flush=True)
 
+        # 打印文件前 200 字符，用于诊断
+        preview = content[:200]
+        print(f"File preview: {preview}", flush=True)
+
+        # 根据 Content-Type 判断文件类型
         content_type = resp.headers.get('Content-Type', '')
         if 'csv' in content_type:
             suffix = 'csv'
@@ -88,33 +105,47 @@ async def analyze_from_url(body: FileURLRequest):
         else:
             suffix = file_url.split('.')[-1].split('?')[0].lower()
             if suffix not in ('csv', 'xls', 'xlsx'):
-                suffix = 'csv'
+                suffix = 'csv'  # 兜底
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
-            tmp.write(resp.content)
+            tmp.write(content)
             tmp_path = tmp.name
 
         result = perform_analysis(suffix, tmp_path)
+        print("Analysis succeeded", flush=True)
         return result
 
     except requests.exceptions.RequestException as e:
         print(f"Download error: {e}", flush=True)
-        return JSONResponse(status_code=400, content={"success": False, "error": f"文件下载失败: {str(e)}"})
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": f"文件下载失败: {str(e)}"}
+        )
     except Exception as e:
         error_detail = traceback.format_exc()
         print(f"Analysis error:\n{error_detail}", flush=True)
-        return JSONResponse(status_code=400, content={"success": False, "error": f"分析失败: {str(e)}"})
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": f"分析失败: {str(e)}", "trace": error_detail}
+        )
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+            print("Temp file deleted", flush=True)
 
 
 @app.post("/upload")
 async def analyze_from_upload(file: UploadFile = File(...)):
-    print("===== Local upload received =====", flush=True)
+    """
+    本地测试接口：直接上传文件（multipart/form-data）
+    """
+    print("Local upload received", flush=True)
     suffix = file.filename.split('.')[-1].lower()
     if suffix not in ('csv', 'xls', 'xlsx'):
-        return JSONResponse(status_code=400, content={"success": False, "error": "仅支持 CSV 或 Excel 文件"})
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "仅支持 CSV 或 Excel 文件"}
+        )
 
     tmp_path = None
     try:
@@ -129,7 +160,10 @@ async def analyze_from_upload(file: UploadFile = File(...)):
     except Exception as e:
         error_detail = traceback.format_exc()
         print(f"Upload error:\n{error_detail}", flush=True)
-        return JSONResponse(status_code=400, content={"success": False, "error": f"分析失败: {str(e)}"})
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": f"分析失败: {str(e)}"}
+        )
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
