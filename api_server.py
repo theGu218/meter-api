@@ -2,6 +2,7 @@
 智能电表能效分析 API 服务
 - /analyze : Coze 专用，接收 JSON {"file": "文件临时URL"}
 - /upload  : 本地测试，直接上传文件（备用）
+- 新增：生成功率趋势图 HTML，并通过静态文件服务提供访问链接
 """
 import sys
 import os
@@ -10,12 +11,16 @@ import traceback
 import math
 import base64
 import io
+import uuid
 import requests
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # 非交互式后端，防止在没有GUI的服务器上报错
 import matplotlib.pyplot as plt
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # 确保可以导入 tools 包
@@ -26,7 +31,11 @@ from tools.consumption_analyzer import analyze_daily_consumption
 from tools.efficiency_evaluator import evaluate_overall_efficiency
 from tools.anomaly_detector import generate_anomaly_alert_report
 
-app = FastAPI(title="智能电表分析API", version="1.7.0")
+app = FastAPI(title="智能电表分析API", version="1.8.0")
+
+# 创建静态文件目录并挂载
+os.makedirs("static/charts", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class FileURLRequest(BaseModel):
@@ -76,7 +85,53 @@ def generate_chart_base64(df: pd.DataFrame, points: int = 200) -> str:
         buf.seek(0)
         return base64.b64encode(buf.read()).decode('utf-8')
     except Exception as e:
-        print(f"Chart generation failed: {e}", flush=True)
+        print(f"Chart (base64) generation failed: {e}", flush=True)
+        return None
+
+
+def generate_chart_html(df: pd.DataFrame, points: int = 200) -> str:
+    """
+    生成功率趋势图的 HTML 文件，并返回可通过静态文件服务访问的 URL 路径。
+    参数与 generate_chart_base64 类似。
+    返回:
+        字符串如 "/static/charts/xxxxx.html"，失败返回 None
+    """
+    try:
+        # 调用已有的 Base64 生成函数
+        img_base64 = generate_chart_base64(df, points)
+        if img_base64 is None:
+            return None
+
+        # 构建一个简单的 HTML 页面，内嵌图表
+        html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>功率趋势图</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; text-align: center; margin: 20px; }}
+        img {{ max-width: 100%; height: auto; border: 1px solid #eee; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+        h2 {{ color: #333; }}
+    </style>
+</head>
+<body>
+    <h2>⚡ 功率趋势图</h2>
+    <p>数据点数：{len(df.tail(points))}</p>
+    <img src="data:image/png;base64,{img_base64}" alt="Power Trend">
+</body>
+</html>"""
+
+        # 使用 UUID 生成唯一文件名，避免并发冲突
+        filename = f"{uuid.uuid4().hex}.html"
+        filepath = os.path.join("static", "charts", filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        # 返回相对路径，客户端使用域名拼接即可访问
+        return f"/static/charts/{filename}"
+    except Exception as e:
+        print(f"HTML chart generation failed: {e}", flush=True)
         return None
 
 
@@ -99,8 +154,9 @@ def perform_analysis(suffix: str, tmp_path: str):
     efficiency = evaluate_overall_efficiency(df)
     anomaly = generate_anomaly_alert_report(df)
 
-    # 生成图表 Base64
+    # 生成图表（Base64 和 HTML）
     chart_base64 = generate_chart_base64(df)
+    chart_html_url = generate_chart_html(df)
 
     result = {
         "success": True,
@@ -122,9 +178,9 @@ def perform_analysis(suffix: str, tmp_path: str):
             "level": anomaly.get('alert_level_description'),
             "details": anomaly.get('details', [])[:5]
         },
-        "chart_base64": chart_base64   # 新增字段
+        "chart_base64": chart_base64,
+        "chart_html_url": chart_html_url   # 新增：可直接在浏览器打开的图表链接
     }
-    # 清理 NaN 值
     return clean_nan(result)
 
 
