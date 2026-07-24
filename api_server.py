@@ -8,9 +8,12 @@ import os
 import tempfile
 import traceback
 import math
+import base64
+import io
 import requests
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -23,7 +26,7 @@ from tools.consumption_analyzer import analyze_daily_consumption
 from tools.efficiency_evaluator import evaluate_overall_efficiency
 from tools.anomaly_detector import generate_anomaly_alert_report
 
-app = FastAPI(title="智能电表分析API", version="1.6.0")
+app = FastAPI(title="智能电表分析API", version="1.7.0")
 
 
 class FileURLRequest(BaseModel):
@@ -42,11 +45,39 @@ def clean_nan(obj):
     elif isinstance(obj, list):
         return [clean_nan(v) for v in obj]
     elif isinstance(obj, np.generic):
-        # numpy 标量，如 np.float64, np.int64 等
         if np.issubdtype(obj, np.floating) and (np.isnan(obj) or np.isinf(obj)):
             return None
         return obj.item()
     return obj
+
+
+def generate_chart_base64(df: pd.DataFrame, points: int = 200) -> str:
+    """
+    生成功率趋势图的 Base64 编码字符串。
+    参数:
+        df: 包含 'timestamp' 和 'active_power' 列的数据
+        points: 最多绘制多少个数据点（防止图片过密）
+    返回:
+        Base64 编码的图片字符串，失败时返回 None
+    """
+    try:
+        plot_df = df.tail(points).copy()
+        plt.figure(figsize=(10, 4))
+        plt.plot(plot_df['timestamp'], plot_df['active_power'], color='blue', linewidth=0.8)
+        plt.title('Power Trend', fontsize=14)
+        plt.xlabel('Time')
+        plt.ylabel('Active Power (W)')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        plt.close()
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Chart generation failed: {e}", flush=True)
+        return None
 
 
 def perform_analysis(suffix: str, tmp_path: str):
@@ -68,6 +99,9 @@ def perform_analysis(suffix: str, tmp_path: str):
     efficiency = evaluate_overall_efficiency(df)
     anomaly = generate_anomaly_alert_report(df)
 
+    # 生成图表 Base64
+    chart_base64 = generate_chart_base64(df)
+
     result = {
         "success": True,
         "data_summary": {
@@ -87,7 +121,8 @@ def perform_analysis(suffix: str, tmp_path: str):
             "high_priority": anomaly.get('statistics', {}).get('high_priority'),
             "level": anomaly.get('alert_level_description'),
             "details": anomaly.get('details', [])[:5]
-        }
+        },
+        "chart_base64": chart_base64   # 新增字段
     }
     # 清理 NaN 值
     return clean_nan(result)
@@ -105,7 +140,6 @@ async def analyze_from_url(body: FileURLRequest):
     file_url = body.file
     tmp_path = None
     try:
-        # 下载文件
         resp = requests.get(file_url, timeout=30, headers={
             "User-Agent": "Mozilla/5.0"
         })
@@ -113,11 +147,9 @@ async def analyze_from_url(body: FileURLRequest):
         content = resp.content
         print(f"Downloaded {len(content)} bytes", flush=True)
 
-        # 打印文件前 200 字符，用于诊断
         preview = content[:200]
         print(f"File preview: {preview}", flush=True)
 
-        # 根据 Content-Type 判断文件类型
         content_type = resp.headers.get('Content-Type', '')
         if 'csv' in content_type:
             suffix = 'csv'
